@@ -31,7 +31,8 @@ import { llmInferenceEndToken } from '../../constants'
 import { EMOTION_EmotionMotionName_value, EMOTION_VRMExpressionName_value, EmotionThinkMotionName } from '../../constants/emotions'
 import { useAudioContext, useSpeakingStore } from '../../stores/audio'
 import { useChatOrchestratorStore } from '../../stores/chat'
-import { useAiriCardStore, useEmotionEngineStore } from '../../stores/modules'
+import { useDatabaseStore } from '../../stores/database'
+import { MemoryStorageMode, useAiriCardStore, useEmotionEngineStore, useMemoryEngineStore } from '../../stores/modules'
 import { useSpeechStore } from '../../stores/modules/speech'
 import { useProvidersStore } from '../../stores/providers'
 import { useSettings } from '../../stores/settings'
@@ -123,6 +124,12 @@ const speechRuntimeStore = useSpeechRuntimeStore()
 const { currentMotion } = storeToRefs(useLive2d())
 
 const emotionEngineStore = useEmotionEngineStore()
+const memoryEngineStore = useMemoryEngineStore()
+const databaseStore = useDatabaseStore()
+
+// 기억 저장 모드가 UserOnly / Exchange일 때 사용자 메시지를 캡처하기 위한 버퍼
+// onBeforeSend에서 기록하고 onAssistantResponseEnd에서 소비한 뒤 초기화한다.
+const lastUserMessage = ref('')
 
 const emotionsQueue = createQueue<EmotionPayload>({
   handlers: [
@@ -149,6 +156,9 @@ const emotionMessageContentQueue = useEmotionsMessageQueue(
     const result = emotionEngineStore.processEvent(event)
     // eslint-disable-next-line no-console
     console.debug('[EmotionEngine]', result.prevState, '→', result.state, `(${result.filler})`)
+
+    // 기억 엔진 턴 동기화 — 감정 이벤트 발생 시마다 호출
+    memoryEngineStore.tick(emotionEngineStore.conversationTurnCount)
 
     if (stageModelRenderer.value === 'vrm') {
       // EngineEmotion → VRM standard expression으로 매핑
@@ -513,8 +523,10 @@ chatHookCleanups.push(onBeforeMessageComposed(async () => {
   })
 }))
 
-chatHookCleanups.push(onBeforeSend(async () => {
+chatHookCleanups.push(onBeforeSend(async (message: string) => {
   currentMotion.value = { group: EmotionThinkMotionName }
+  // UserOnly / Exchange 모드에서 사용자 메시지 캡처
+  lastUserMessage.value = message
 }))
 
 chatHookCleanups.push(onTokenLiteral(async (literal) => {
@@ -531,9 +543,43 @@ chatHookCleanups.push(onStreamEnd(async () => {
   currentChatIntent?.writeFlush()
 }))
 
-chatHookCleanups.push(onAssistantResponseEnd(async (_message) => {
+chatHookCleanups.push(onAssistantResponseEnd(async (message: string) => {
   currentChatIntent?.end()
   currentChatIntent = null
+
+  // 기억 저장 모드에 따라 에피소딕 기억 생성
+  const mode = memoryEngineStore.storageMode
+  if (mode !== MemoryStorageMode.Disabled) {
+    const probValues = Object.values(emotionEngineStore.prior) as number[]
+    const emotionMeta = {
+      emotionDist: probValues,
+      dominantEmotion: emotionEngineStore.currentState,
+      energy: emotionEngineStore.energy,
+      dissonance: emotionEngineStore.dissonance,
+    }
+
+    const userText = lastUserMessage.value.trim()
+    const assistantText = message.trim()
+
+    if (mode === MemoryStorageMode.Exchange) {
+      // 한 턴 전체 저장: "User: X\nAiri: Y" — eCMR 맥락 보존에 최적
+      const content = [
+        userText && `User: ${userText}`,
+        assistantText && `Airi: ${assistantText}`,
+      ].filter(Boolean).join('\n')
+      if (content)
+        memoryEngineStore.store({ content, ...emotionMeta })
+    }
+    else if (mode === MemoryStorageMode.AssistantOnly && assistantText) {
+      memoryEngineStore.store({ content: assistantText, ...emotionMeta })
+    }
+    else if (mode === MemoryStorageMode.UserOnly && userText) {
+      memoryEngineStore.store({ content: userText, ...emotionMeta })
+    }
+  }
+
+  lastUserMessage.value = ''  // 다음 턴을 위해 초기화
+
   // const res = await embed({
   //   ...transformersProvider.embed('Xenova/nomic-embed-text-v1'),
   //   input: message,
@@ -562,8 +608,21 @@ if (typeof window !== 'undefined') {
 }
 
 onMounted(async () => {
-  db.value = drizzle({ connection: { bundles: getImportUrlBundles() } })
-  await db.value.execute(`CREATE TABLE memory_test (vec FLOAT[768]);`)
+  const instance = drizzle({ connection: { bundles: getImportUrlBundles() } })
+  db.value = instance
+  databaseStore.setDb(instance)
+
+  // 기억 엔진 테이블 초기화
+  // NOTICE: IF NOT EXISTS — 재마운트/HMR 시 중복 생성 방지
+  await instance.execute(`
+    CREATE TABLE IF NOT EXISTS memories (
+      memory_id TEXT PRIMARY KEY,
+      data      TEXT NOT NULL
+    )
+  `)
+
+  // DuckDB에서 기억 로드 + 세션 메타(current_turn, storage_mode 등) 복원
+  await memoryEngineStore.initFromDatabase()
 })
 
 watch([stageModelRenderer, () => props.paused], ([renderer]) => {

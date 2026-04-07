@@ -10,6 +10,8 @@ import SystemPromptV2 from '../../constants/prompts/system-v2'
 
 import { useSettingsStageModel } from '../settings/stage-model'
 import { useConsciousnessStore } from './consciousness'
+import { EMOTION_ENGINE_EVENT_INSTRUCTIONS, useEmotionEngineStore } from './emotion-engine'
+import { useMemoryEngineStore } from './memory-engine'
 import { useSpeechStore } from './speech'
 
 export interface AiriExtension {
@@ -71,6 +73,8 @@ export const useAiriCardStore = defineStore('airi-card', () => {
   const consciousnessStore = useConsciousnessStore()
   const speechStore = useSpeechStore()
   const stageModelStore = useSettingsStageModel()
+  const emotionEngineStore = useEmotionEngineStore()
+  const memoryEngineStore = useMemoryEngineStore()
 
   const {
     activeProvider: activeConsciousnessProvider,
@@ -292,7 +296,15 @@ export const useAiriCardStore = defineStore('airi-card', () => {
         card.personality,
       ].filter(Boolean)
 
+      // EMOTION_ENGINE_EVENT_INSTRUCTIONS: 정적 상수이므로 base에 1회만 포함
+      // (매 턴 동적으로 재삽입하면 프롬프트 캐시가 무효화되어 토큰 낭비)
+      // buildEmotionPrompt()는 감정 상태에 따라 변하는 동적 부분만 담당
+      // buildMemoryPrompt()는 현재 감정 분포와 가장 가까운 에피소딕 기억 top-3를 삽입
+      const probValues = Object.values(emotionEngineStore.prior) as number[]
       return components.join('\n')
+        + EMOTION_ENGINE_EVENT_INSTRUCTIONS
+        + emotionEngineStore.buildEmotionPrompt()
+        + memoryEngineStore.buildMemoryPrompt(probValues)
     }),
   }
 })

@@ -251,6 +251,42 @@ const APPRAISAL_MODIFIERS: Record<AppraisalKey, EmotionModifiers> = {
 }
 
 // ─────────────────────────────────────────────────
+//  [4] 마르코프 전이 행렬 — 감정 간 자연스러운 '거리' 반영
+//  행(row) = 현재 감정, 열(col) = 다음 감정으로의 전이 선호도 (각 행 합 = 1.0)
+//  설계 원칙:
+//    - 감정 유사성: Happy↔Excited, Sassy↔Tired 는 전이 확률 높음
+//    - 감정 반발성: Happy→Tired, Excited→Sassy 는 전이 확률 낮음
+//    - Neutral은 모든 감정에서 중간 수준의 탈출구 역할
+// ─────────────────────────────────────────────────
+
+const MARKOV_TRANSITION: Record<EngineEmotion, Record<EngineEmotion, number>> = {
+  [EngineEmotion.Happy]: {
+    [EngineEmotion.Happy]: 0.50, [EngineEmotion.Neutral]: 0.20, [EngineEmotion.Sassy]: 0.05,
+    [EngineEmotion.Tired]: 0.05, [EngineEmotion.Excited]: 0.15, [EngineEmotion.Confused]: 0.05,
+  },
+  [EngineEmotion.Neutral]: {
+    [EngineEmotion.Happy]: 0.15, [EngineEmotion.Neutral]: 0.50, [EngineEmotion.Sassy]: 0.10,
+    [EngineEmotion.Tired]: 0.10, [EngineEmotion.Excited]: 0.10, [EngineEmotion.Confused]: 0.05,
+  },
+  [EngineEmotion.Sassy]: {
+    [EngineEmotion.Happy]: 0.05, [EngineEmotion.Neutral]: 0.15, [EngineEmotion.Sassy]: 0.45,
+    [EngineEmotion.Tired]: 0.20, [EngineEmotion.Excited]: 0.03, [EngineEmotion.Confused]: 0.12,
+  },
+  [EngineEmotion.Tired]: {
+    [EngineEmotion.Happy]: 0.05, [EngineEmotion.Neutral]: 0.20, [EngineEmotion.Sassy]: 0.25,
+    [EngineEmotion.Tired]: 0.40, [EngineEmotion.Excited]: 0.02, [EngineEmotion.Confused]: 0.08,
+  },
+  [EngineEmotion.Excited]: {
+    [EngineEmotion.Happy]: 0.25, [EngineEmotion.Neutral]: 0.15, [EngineEmotion.Sassy]: 0.05,
+    [EngineEmotion.Tired]: 0.15, [EngineEmotion.Excited]: 0.35, [EngineEmotion.Confused]: 0.05,
+  },
+  [EngineEmotion.Confused]: {
+    [EngineEmotion.Happy]: 0.05, [EngineEmotion.Neutral]: 0.20, [EngineEmotion.Sassy]: 0.20,
+    [EngineEmotion.Tired]: 0.20, [EngineEmotion.Excited]: 0.03, [EngineEmotion.Confused]: 0.32,
+  },
+}
+
+// ─────────────────────────────────────────────────
 //  결과 타입
 // ─────────────────────────────────────────────────
 
@@ -272,15 +308,33 @@ export interface EmotionEngineResult {
 export interface EmotionEngineSerializable {
   currentState: EngineEmotion
   turnCount: number
+  conversationTurnCount: number
   energy: number
   dissonance: number
   prior: Record<EngineEmotion, number>
   peakMemory: Array<{ emotion: EngineEmotion, intensity: number, turn: number }>
-  peakIntensity: number
   recentEvents: EngineEvent[]
   turnsSinceStrongEvent: number
   rngState: [number, number, number, number]
 }
+
+// ─────────────────────────────────────────────────
+//  감정 이벤트 지시 — 정적 상수 (시스템 프롬프트 base에 1회만 포함)
+// ─────────────────────────────────────────────────
+
+export const EMOTION_ENGINE_EVENT_INSTRUCTIONS
+  = '\n\n[감정 이벤트 지시]'
+  + '\n대화 중 아래 이벤트를 감지하면 반드시 해당 ACT 토큰을 응답에 포함하라.'
+  + '\n형식: <|ACT: {"event": "<이벤트명>"}|>'
+  + '\n- praise: 상대가 나를 칭찬하거나 긍정적으로 평가할 때'
+  + '\n- scold: 상대가 나를 꾸짖거나 부정적으로 비판할 때'
+  + '\n- joke: 농담이나 유머러스한 상호작용이 있을 때'
+  + '\n- ignore: 내 말이 무시되거나 대화가 단절될 때'
+  + '\n- ask_hard: 어렵거나 복잡한 질문을 받을 때'
+  + '\n- ask_easy: 간단하고 쉬운 질문을 받을 때'
+  + '\n- agree: 상대가 내 의견에 동의하거나 공감할 때'
+  + '\n- disagree: 상대가 내 의견에 반박하거나 이의를 제기할 때'
+  + '\n(기존 <|ACT: {"emotion": "..."}|> 형식도 병행 사용 가능)'
 
 // ─────────────────────────────────────────────────
 //  내부 헬퍼
@@ -321,10 +375,12 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
   // ── 상태 ──
   const currentState = ref<EngineEmotion>(EngineEmotion.Neutral)
   const turnCount = ref(0)
+  // 실제 대화 회차 — processEvent와 setEmotionDirect 양쪽에서 모두 증가
+  // turnCount는 engine-event 경로에서만 증가하므로 buildEmotionPrompt용으로 부정확함
+  const conversationTurnCount = ref(0)
   const energy = ref(1.0)
   const prior = ref<Record<EngineEmotion, number>>(uniformPrior())
   const peakMemory = ref<Array<{ emotion: EngineEmotion, intensity: number, turn: number }>>([])
-  const peakIntensity = ref(0.0)
   const recentEvents = ref<EngineEvent[]>([])
   const dissonance = ref(0.0)
   const turnsSinceStrongEvent = ref(0)
@@ -339,8 +395,13 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
     if (turnsSinceStrongEvent.value < decayTurnInterval)
       return false
 
+    // 카운터 리셋: decayTurnInterval마다 1회만 실행되도록 보장
+    turnsSinceStrongEvent.value = 0
+
     const maxProb = Math.max(...Object.values(prior.value))
-    const intensityFactor = Math.max(0.3, 1.0 - maxProb)
+    // NOTICE: maxProb에 비례하도록 수정 — 감정이 지배적일수록 decay를 강하게 적용해야
+    // lock-in을 방지할 수 있다. 기존 (1-maxProb) 공식은 역방향이었음.
+    const intensityFactor = Math.max(0.3, maxProb)
     const decayFactor = Math.min(0.6, decayRate * intensityFactor)
     const baseline = 1.0 / ENGINE_EMOTION_VALUES.length
 
@@ -381,10 +442,10 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
     const maxEmotion = ENGINE_EMOTION_VALUES.reduce((a, b) => posterior[a] > posterior[b] ? a : b)
     const intensity = posterior[maxEmotion]
     if (intensity > 0.5) {
-      peakMemory.value.push({ emotion: maxEmotion, intensity, turn: turnCount.value })
+      // conversationTurnCount 기준으로 저장 — 피크 recency 계산에 사용
+      peakMemory.value.push({ emotion: maxEmotion, intensity, turn: conversationTurnCount.value })
       if (peakMemory.value.length > 5)
         peakMemory.value = peakMemory.value.slice(-5)
-      peakIntensity.value = Math.max(peakIntensity.value, intensity)
       turnsSinceStrongEvent.value = 0
     }
   }
@@ -404,13 +465,15 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
     return normalize(biased)
   }
 
-  // ── [4] 마르코프 관성 ──
+  // ── [4] 마르코프 전이 행렬 ──
   function markovBlend(posterior: Record<EngineEmotion, number>): Record<EngineEmotion, number> {
+    // 전이 행렬에서 현재 감정의 선호 분포를 꺼내 inertia 비율로 블렌딩
+    // 기존: 현재 감정에만 +inertia (1차원 관성)
+    // 개선: 전이 행렬로 감정 간 거리(친밀/반발) 반영
+    const transition = MARKOV_TRANSITION[currentState.value as EngineEmotion]
     const blended = {} as Record<EngineEmotion, number>
-    for (const e of ENGINE_EMOTION_VALUES) {
-      const stayBonus = e === currentState.value ? inertia : 0.0
-      blended[e] = posterior[e] * (1 - inertia) + stayBonus
-    }
+    for (const e of ENGINE_EMOTION_VALUES)
+      blended[e] = posterior[e] * (1 - inertia) + transition[e] * inertia
     return normalize(blended)
   }
 
@@ -431,14 +494,29 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
   }
 
   function updateEnergy(event: EngineEvent): void {
+    // 점근적 자동 회복: 에너지가 낮을수록 회복 빠르고, 가득 찰수록 느림
+    // += 0.01 * (1 - energy): 1.0 근방에서 자연스럽게 수렴 (HP포션식 직선 → 피로 곡선)
+    energy.value = Math.min(1.0, energy.value + 0.01 * (1.0 - energy.value))
+
+    // Tired 상태에서 Joke/Praise → 1.5x 감동 보정
+    const tiredBonus = currentState.value === EngineEmotion.Tired
+      && (event === EngineEvent.Joke || event === EngineEvent.Praise)
+
     if (event in DRAIN_EVENTS) {
       energy.value = Math.max(0.0, energy.value - energyDrain * DRAIN_EVENTS[event]!)
     }
     else if (event in REGEN_EVENTS) {
-      energy.value = Math.min(1.0, energy.value + energyRegen * REGEN_EVENTS[event]!)
+      const mult = REGEN_EVENTS[event]! * (tiredBonus ? 1.5 : 1.0)
+      energy.value = Math.min(1.0, energy.value + energyRegen * mult)
     }
     else if (event in NEUTRAL_DRAIN_EVENTS) {
-      energy.value = Math.max(0.0, energy.value - energyDrain * NEUTRAL_DRAIN_EVENTS[event]!)
+      if (tiredBonus) {
+        // Joke while Tired → drain 대신 1.5x 회복으로 전환
+        energy.value = Math.min(1.0, energy.value + energyRegen * 1.5)
+      }
+      else {
+        energy.value = Math.max(0.0, energy.value - energyDrain * NEUTRAL_DRAIN_EVENTS[event]!)
+      }
     }
   }
 
@@ -479,7 +557,8 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
       return 0.0
     }
 
-    const recent = recentEvents.value.slice(-4)
+    // recentEvents는 최대 5개로 유지되므로 전체 윈도우를 사용
+    const recent = recentEvents.value
     let totalConflict = 0.0
     for (let i = 0; i < recent.length; i++) {
       for (let j = i + 1; j < recent.length; j++) {
@@ -525,9 +604,13 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
         const drift = probs[e] * ddmDriftRate
         const noise = (rng.value.random() - 0.5) * ddmNoise
         accum[e] += drift + noise
-        if (accum[e] >= threshold && winner === null)
-          winner = e
       }
+      // NOTICE: winner 체크를 inner loop 밖으로 이동 — 기존 코드는 같은 step에서
+      // 여러 감정이 threshold를 넘을 때 배열 순서(happy 우선)로 당선자가 결정되는
+      // 순서 편향이 있었음. 이제 한 step 내 모든 누적 완료 후 가장 높은 값을 당선자로 선택.
+      const crossed = ENGINE_EMOTION_VALUES.filter(e => accum[e] >= threshold)
+      if (crossed.length > 0)
+        winner = crossed.reduce((a, b) => accum[a] > accum[b] ? a : b)
     }
 
     if (winner === null)
@@ -559,8 +642,25 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
   // ─────────────────────────────────────────────
 
   function processEvent(event: EngineEvent | string): EmotionEngineResult {
+    if (!ENGINE_EVENT_VALUES.includes(event as EngineEvent)) {
+      console.warn(`[EmotionEngine] Unknown event "${event}", skipping.`)
+      return {
+        state: currentState.value,
+        probabilities: { ...prior.value },
+        prevState: currentState.value,
+        directive: EMOTION_DIRECTIVES[currentState.value],
+        ddmSteps: 0,
+        ddmDelayMs: 0,
+        energy: energy.value,
+        dissonance: dissonance.value,
+        peakMemory: peakMemory.value.at(-1) ?? null,
+        decayApplied: false,
+        filler: '',
+      }
+    }
     const evt = event as EngineEvent
     turnCount.value++
+    conversationTurnCount.value++
     const prev = currentState.value
 
     // [5] 쾌락 적응
@@ -627,6 +727,7 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
     const emo = emotion as EngineEmotion
     const prev = currentState.value
     currentState.value = emo
+    conversationTurnCount.value++
 
     // prior를 해당 감정 중심으로 soft-set (급격한 전환 방지)
     const n = ENGINE_EMOTION_VALUES.length
@@ -673,8 +774,14 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
 
     let peakDesc = ''
     if (peakMemory.value.length > 0) {
-      const peak = peakMemory.value.reduce((a, b) => a.intensity > b.intensity ? a : b)
-      peakDesc = `\n과거 대화에서 강하게 '${EMOTION_KR[peak.emotion]}' 감정을 느꼈던 기억이 남아있다.`
+      type PeakEntry = { emotion: EngineEmotion, intensity: number, turn: number }
+      const peak = peakMemory.value.reduce(
+        (a: PeakEntry, b: PeakEntry) => a.intensity > b.intensity ? a : b,
+      )
+      // 피크가 15턴 이내일 때만 프롬프트에 포함 — 오래된 기억은 자연스럽게 소멸
+      const turnsAgo = conversationTurnCount.value - peak.turn
+      if (turnsAgo <= 15)
+        peakDesc = `\n과거 대화에서 강하게 '${EMOTION_KR[peak.emotion as EngineEmotion]}' 감정을 느꼈던 기억이 남아있다.`
     }
 
     return (
@@ -683,7 +790,7 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
       + energyDesc
       + dissonanceDesc
       + peakDesc
-      + `\n(대화 회차: ${turnCount.value}회차 | 에너지: ${Math.round(energy.value * 100)}%)`
+      + `\n(대화 회차: ${conversationTurnCount.value}회차 | 에너지: ${Math.round(energy.value * 100)}%)`
     )
   }
 
@@ -692,11 +799,11 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
     return {
       currentState: currentState.value,
       turnCount: turnCount.value,
+      conversationTurnCount: conversationTurnCount.value,
       energy: energy.value,
       dissonance: dissonance.value,
       prior: { ...prior.value },
       peakMemory: [...peakMemory.value],
-      peakIntensity: peakIntensity.value,
       recentEvents: [...recentEvents.value],
       turnsSinceStrongEvent: turnsSinceStrongEvent.value,
       rngState: rng.value.getState(),
@@ -707,11 +814,12 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
   function restore(data: EmotionEngineSerializable): void {
     currentState.value = data.currentState
     turnCount.value = data.turnCount
+    // 구버전 sessionStorage에 conversationTurnCount가 없을 수 있으므로 fallback
+    conversationTurnCount.value = data.conversationTurnCount ?? data.turnCount
     energy.value = data.energy
     dissonance.value = data.dissonance
     prior.value = { ...data.prior }
     peakMemory.value = [...data.peakMemory]
-    peakIntensity.value = data.peakIntensity
     recentEvents.value = [...data.recentEvents]
     turnsSinceStrongEvent.value = data.turnsSinceStrongEvent
     rng.value.setState(data.rngState)
@@ -755,10 +863,10 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
   function reset(): void {
     currentState.value = EngineEmotion.Neutral
     turnCount.value = 0
+    conversationTurnCount.value = 0
     energy.value = 1.0
     dissonance.value = 0.0
     peakMemory.value = []
-    peakIntensity.value = 0.0
     recentEvents.value = []
     turnsSinceStrongEvent.value = 0
     prior.value = uniformPrior()
@@ -769,8 +877,10 @@ export const useEmotionEngineStore = defineStore('emotion-engine', () => {
     // state
     currentState,
     turnCount,
+    conversationTurnCount,
     energy,
     dissonance,
+    prior,
     peakMemory,
     // computed
     directive,
