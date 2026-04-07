@@ -11,6 +11,7 @@ import type { VRM } from '@pixiv/three-vrm'
 import type { TresContext } from '@tresjs/core'
 import type { DirectionalLight, SphericalHarmonics3, Texture, WebGLRenderer, WebGLRenderTarget } from 'three'
 
+import type { VisemeFrame } from '../composables/vrm/arkit-face'
 import type { SceneBootstrap, ScenePhase, Vec3 } from '../stores/model-store'
 import type { VrmLifecycleReason } from '../trace'
 
@@ -693,6 +694,13 @@ defineExpose({
   renderer: () => tresCanvasRef.value?.renderer.instance,
   scene: () => modelRef.value?.scene,
   readRenderTargetRegionAtClientPoint,
+  playVisemeSequence: (sequence: VisemeFrame[]) => {
+    modelRef.value?.playVisemeSequence(sequence)
+  },
+  stopVisemeSequence: () => {
+    modelRef.value?.stopVisemeSequence()
+  },
+  isPerfectSync: computed(() => modelRef.value?.isPerfectSync ?? false),
 })
 </script>
 

@@ -15,6 +15,7 @@ import { createPlaybackManager, createSpeechPipeline } from '@proj-airi/pipeline
 import { Live2DScene, useLive2d } from '@proj-airi/stage-ui-live2d'
 import { ThreeScene } from '@proj-airi/stage-ui-three'
 import { animations } from '@proj-airi/stage-ui-three/assets/vrm'
+import { fillerToVisemeSequence } from '@proj-airi/stage-ui-three/composables/vrm'
 import { createQueue } from '@proj-airi/stream-kit'
 import { useBroadcastChannel } from '@vueuse/core'
 // import { createTransformers } from '@xsai-transformers/embed'
@@ -30,7 +31,7 @@ import { llmInferenceEndToken } from '../../constants'
 import { EMOTION_EmotionMotionName_value, EMOTION_VRMExpressionName_value, EmotionThinkMotionName } from '../../constants/emotions'
 import { useAudioContext, useSpeakingStore } from '../../stores/audio'
 import { useChatOrchestratorStore } from '../../stores/chat'
-import { useAiriCardStore } from '../../stores/modules'
+import { useAiriCardStore, useEmotionEngineStore } from '../../stores/modules'
 import { useSpeechStore } from '../../stores/modules/speech'
 import { useProvidersStore } from '../../stores/providers'
 import { useSettings } from '../../stores/settings'
@@ -121,6 +122,8 @@ const speechRuntimeStore = useSpeechRuntimeStore()
 
 const { currentMotion } = storeToRefs(useLive2d())
 
+const emotionEngineStore = useEmotionEngineStore()
+
 const emotionsQueue = createQueue<EmotionPayload>({
   handlers: [
     async (ctx) => {
@@ -139,10 +142,43 @@ const emotionsQueue = createQueue<EmotionPayload>({
   ],
 })
 
-const emotionMessageContentQueue = useEmotionsMessageQueue(emotionsQueue)
+const emotionMessageContentQueue = useEmotionsMessageQueue(
+  emotionsQueue,
+  // engine-event 수신 시 감정 엔진 실행 → VRM/Live2D에 반영
+  (event) => {
+    const result = emotionEngineStore.processEvent(event)
+    // eslint-disable-next-line no-console
+    console.debug('[EmotionEngine]', result.prevState, '→', result.state, `(${result.filler})`)
+
+    if (stageModelRenderer.value === 'vrm') {
+      // EngineEmotion → VRM standard expression으로 매핑
+      // (퍼펙트싱크 VRM은 state 이름을 그대로 사용 가능)
+      vrmViewerRef.value?.setExpression(result.state, result.energy)
+      // 추임새 비지음 시퀀스 재생 (TTS 시작 전 입모양 애니메이션)
+      if (result.filler)
+        vrmViewerRef.value?.playVisemeSequence(fillerToVisemeSequence(result.filler))
+    }
+    else if (stageModelRenderer.value === 'live2d') {
+      // EngineEmotion → Live2D 모션 (가장 가까운 표준 감정 매핑)
+      const live2dMotionMap: Record<string, string> = {
+        happy: 'Happy', neutral: 'Idle', sassy: 'Angry',
+        tired: 'Sad', excited: 'Happy', confused: 'Question',
+      }
+      currentMotion.value = { group: live2dMotionMap[result.state] ?? 'Idle' }
+    }
+  },
+  // PATCH-5: 기존 emotion ACT → setEmotionDirect로 엔진 상태 동기화
+  (emotion) => {
+    emotionEngineStore.setEmotionDirect(emotion)
+  },
+)
 emotionMessageContentQueue.onHandlerEvent('emotion', (emotion) => {
   // eslint-disable-next-line no-console
   console.debug('emotion detected', emotion)
+})
+emotionMessageContentQueue.onHandlerEvent('engine-event', (event: string) => {
+  // eslint-disable-next-line no-console
+  console.debug('engine event detected', event)
 })
 
 const delaysQueue = useDelayMessageQueue()
@@ -171,6 +207,9 @@ async function playFunction(item: Parameters<Parameters<typeof createPlaybackMan
       return
     }
   }
+
+  // TTS 시작 전 viseme 추임새 중단 (wLipSync가 이후 입모양 제어)
+  vrmViewerRef.value?.stopVisemeSequence()
 
   const source = audioContext.createBufferSource()
   currentAudioSource.value = source

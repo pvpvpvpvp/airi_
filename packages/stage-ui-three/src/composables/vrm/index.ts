@@ -1,4 +1,6 @@
 export * from './animation'
+export * from './arkit-face'
+export * from './viseme-player'
 export * from './core'
 export * from './expression'
 export * from './lip-sync'

@@ -78,6 +78,8 @@ import { loadVrm } from '../../composables/vrm/core'
 import { useVRMEmote } from '../../composables/vrm/expression'
 import { resolveInternalVrmHooks } from '../../composables/vrm/internal-hooks'
 import { useVRMLipSync } from '../../composables/vrm/lip-sync'
+import { useARKitFaceController } from '../../composables/vrm/arkit-face'
+import { useVRMVisemePlayer } from '../../composables/vrm/viseme-player'
 import {
   createThreeRendererMemorySnapshot,
   createVrmSceneSummarySnapshot,
@@ -202,6 +204,9 @@ const blink = useBlink()
 const idleEyeSaccades = useIdleEyeSaccades()
 const vrmEmote = ref<ReturnType<typeof useVRMEmote>>()
 const vrmLipSync = useVRMLipSync(currentAudioSource)
+// PATCH-6: ARKit face controller — init(vrm) 호출로 퍼펙트싱크 여부 감지
+const arkitFaceController = useARKitFaceController()
+const vrmVisemePlayer = useVRMVisemePlayer(vrm, arkitFaceController.isPerfectSync)
 
 // For sky box update
 const nprProgramVersion = ref(0)
@@ -309,6 +314,8 @@ function applyManagedVrmInstance(instance: ManagedVrmInstance) {
   vrmGroup.value = instance.group
   vrmAnimationMixer.value = instance.mixer
   vrmEmote.value = instance.emote
+  // PATCH-6: VRM 로드 완료 시 퍼펙트싱크 감지
+  arkitFaceController.init(instance.vrm)
 }
 
 function destroyManagedVrmInstance(instance?: ManagedVrmInstance) {
@@ -1076,6 +1083,9 @@ defineExpose({
   lookAtUpdate(target: Vec3) {
     idleEyeSaccades.instantUpdate(vrm.value, target)
   },
+  playVisemeSequence: vrmVisemePlayer.playVisemeSequence,
+  stopVisemeSequence: vrmVisemePlayer.stopVisemeSequence,
+  isPerfectSync: arkitFaceController.isPerfectSync,
 })
 </script>
 
