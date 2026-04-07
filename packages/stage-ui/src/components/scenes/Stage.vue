@@ -32,7 +32,7 @@ import { EMOTION_EmotionMotionName_value, EMOTION_VRMExpressionName_value, Emoti
 import { useAudioContext, useSpeakingStore } from '../../stores/audio'
 import { useChatOrchestratorStore } from '../../stores/chat'
 import { useDatabaseStore } from '../../stores/database'
-import { MemoryStorageMode, useAiriCardStore, useEmotionEngineStore, useMemoryEngineStore } from '../../stores/modules'
+import { MemoryStorageMode, useAiriCardStore, useBeliefEngineStore, useEmotionEngineStore, useMemoryEngineStore } from '../../stores/modules'
 import { useSpeechStore } from '../../stores/modules/speech'
 import { useProvidersStore } from '../../stores/providers'
 import { useSettings } from '../../stores/settings'
@@ -125,6 +125,7 @@ const { currentMotion } = storeToRefs(useLive2d())
 
 const emotionEngineStore = useEmotionEngineStore()
 const memoryEngineStore = useMemoryEngineStore()
+const beliefEngineStore = useBeliefEngineStore()
 const databaseStore = useDatabaseStore()
 
 // 기억 저장 모드가 UserOnly / Exchange일 때 사용자 메시지를 캡처하기 위한 버퍼
@@ -527,6 +528,13 @@ chatHookCleanups.push(onBeforeSend(async (message: string) => {
   currentMotion.value = { group: EmotionThinkMotionName }
   // UserOnly / Exchange 모드에서 사용자 메시지 캡처
   lastUserMessage.value = message
+
+  // BDI 추론 사이클: 사용자 발화에서 가치관 추출 → 부조화 산출 → 의도 전환
+  const bdiResult = beliefEngineStore.analyze(message)
+  if (bdiResult.shouldSpikeEmotion && bdiResult.spikeEmotion) {
+    // 핵심 가치관 충돌 → 감정 엔진에 즉각 감정 스파이크 전달
+    emotionEngineStore.setEmotionDirect(bdiResult.spikeEmotion)
+  }
 }))
 
 chatHookCleanups.push(onTokenLiteral(async (literal) => {
@@ -623,6 +631,9 @@ onMounted(async () => {
 
   // DuckDB에서 기억 로드 + 세션 메타(current_turn, storage_mode 등) 복원
   await memoryEngineStore.initFromDatabase()
+
+  // 신념 엔진 세션 메타 복원 (current_intention, cumulative_dissonance 등)
+  beliefEngineStore.init()
 })
 
 watch([stageModelRenderer, () => props.paused], ([renderer]) => {

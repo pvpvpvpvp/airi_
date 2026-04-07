@@ -1,4 +1,5 @@
 export * from './airi-card'
+export * from './belief-engine'
 export * from './emotion-engine'
 export * from './memory-engine'
 export * from './consciousness'
